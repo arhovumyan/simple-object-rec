@@ -104,6 +104,7 @@ class ObjectDetectionPipeline:
         """Stage 1: Use YOLOv8 for object detection"""
         try:
             # Run YOLO detection
+            self.logger.info("🔍 STAGE 1: Running YOLOv8 detection...")
             results = self.yolo_model(
                 frame,
                 conf=self.yolo_confidence,
@@ -389,6 +390,7 @@ class ObjectDetectionPipeline:
             return None
         
         # Stage 2: Classify with MobileNetV3
+        self.logger.info(f"🧠 STAGE 2: Sending {yolo_class} to MobileNetV3 for classification...")
         self.classifications_performed += 1
         classification_result = self.classify_with_mobilenet(cropped_obj)
         
@@ -468,37 +470,40 @@ class ObjectDetectionPipeline:
                 cv2.putText(frame, mobile_text, (x1, y2+40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
     
     def draw_current_detections(self, frame, detections):
-        """Draw only current detections (no persistence to avoid multiple boxes)"""
-        for result in detections:
+        """Draw only current detections with clear pipeline visualization"""
+        for i, result in enumerate(detections):
             x1, y1, x2, y2 = result['bbox']
             
             # Choose color based on whether it's a target
             if result['is_target']:
                 color = (0, 255, 0)  # Green for targets
                 thickness = 3
-                label = f"TARGET: {result['target_type'].upper()}"
+                final_label = f"TARGET: {result['target_type'].upper()}"
             else:
                 color = (0, 0, 255)  # Red for non-targets
                 thickness = 2
-                label = f"NON-TARGET: {result['yolo_class']}"
+                final_label = f"NON-TARGET: {result['yolo_class']}"
             
             # Draw bounding box
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
             
-            # Draw label
-            cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            # Draw pipeline stage indicator
+            stage_text = f"[{i+1}] YOLO→MobileNet Pipeline"
+            cv2.putText(frame, stage_text, (x1, y1-50), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
             
-            # Draw confidence
-            confidence = result['final_confidence']
-            conf_text = f"Conf: {confidence:.2f}"
-            cv2.putText(frame, conf_text, (x1, y2+20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            # Draw YOLO detection info (Stage 1) - Black text
+            yolo_text = f"STAGE 1 - YOLO: {result['yolo_class']} ({result['yolo_confidence']:.2f})"
+            cv2.putText(frame, yolo_text, (x1, y1-30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
             
-            # Draw MobileNet classification if available
+            # Draw MobileNet classification info (Stage 2) - Dark blue text
             if result.get('mobilenet_classification'):
                 mobilenet_class = result['mobilenet_classification']['class']
                 mobilenet_conf = result['mobilenet_classification']['confidence']
-                mobile_text = f"MobileNet: {mobilenet_class} ({mobilenet_conf:.2f})"
-                cv2.putText(frame, mobile_text, (x1, y2+40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                mobile_text = f"STAGE 2 - MobileNet: {mobilenet_class} ({mobilenet_conf:.2f})"
+                cv2.putText(frame, mobile_text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (139, 0, 0), 1)
+            
+            # Draw final result
+            cv2.putText(frame, final_label, (x1, y2+20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     
     def draw_results(self, frame, results):
         """Draw detection results on frame (legacy method - kept for compatibility)"""
@@ -573,6 +578,8 @@ class ObjectDetectionPipeline:
             
             # Run detection exactly 10 times per second (every 100ms)
             if current_time - last_detection_time >= detection_interval:
+                self.logger.info("🚀 STARTING TWO-STAGE PIPELINE...")
+                
                 # Stage 1: YOLOv8 Detection
                 detections = self.detect_objects_yolo(frame)
                 
@@ -586,6 +593,7 @@ class ObjectDetectionPipeline:
                         if result['is_target']:
                             self.target_objects_found += 1
                 
+                self.logger.info(f"✅ PIPELINE COMPLETE: {len(current_detections)} objects processed")
                 last_detection_time = current_time
             
             # Draw only current detections (no persistence to avoid multiple boxes)
@@ -602,8 +610,12 @@ class ObjectDetectionPipeline:
                 stats_text = f"FPS: {fps} | Detections: {self.total_detections} | Targets: {self.target_objects_found}"
                 cv2.putText(frame, stats_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             
-            # Legend
-            cv2.putText(frame, "GREEN: Target Objects | RED: Non-Target Objects (Anti-Flickering)", 
+            # Pipeline Legend
+            cv2.putText(frame, "TWO-STAGE PIPELINE: YOLOv8 (Detection) → MobileNetV3 (Classification)", 
+                       (10, height-60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame, "GREEN: Target Objects | RED: Non-Target Objects", 
+                       (10, height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame, "BLACK: YOLO Results | DARK BLUE: MobileNet Results", 
                        (10, height-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
             # Display frame
