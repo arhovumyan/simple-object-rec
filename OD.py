@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 
 """
-Object Detection and Classification Pipeline
-First uses YOLOv8 for object detection, then MobileNetV3 for classification
-to determine if detected objects are what we're looking for.
+Object Detection and Classification Pipeline with Queue-based Async Processing
+Optimized for GPU efficiency using concurrent processing with queues.
+
+Architecture:
+- YOLO runs on every frame (GPU) - Fast detection
+- Detected objects queue up for MobileNet classification
+- MobileNet processes queue in batches (GPU) - Efficient classification
+- Results merge back for display
+
+Benefits:
+- Both models run on GPU without contention
+- Sequential pipeline with async processing
+- Lower overhead than multiprocessing
+- Better GPU utilization
 """
 
 import cv2
@@ -19,20 +30,25 @@ import time
 import logging
 from datetime import datetime
 import os
+from queue import Queue, Empty
+from threading import Thread, Lock
+from collections import deque
+import uuid
 
-class ObjectDetectionPipeline:
-    def __init__(self):
+class AsyncObjectDetectionPipeline:
+    def __init__(self, max_queue_size=30, batch_size=4):
         print("=" * 60)
-        print("OBJECT DETECTION & CLASSIFICATION PIPELINE")
+        print("ASYNC OBJECT DETECTION & CLASSIFICATION PIPELINE")
         print("=" * 60)
-        print("Stage 1: YOLOv8 Object Detection")
-        print("Stage 2: MobileNetV3 Classification")
+        print("Architecture: Queue-based Async Processing")
+        print("Stage 1: YOLOv8 Object Detection (GPU)")
+        print("Stage 2: MobileNetV3 Classification (GPU)")
+        print("Processing: Async Queue with Batch Processing")
         print("=" * 60)
         
         self.setup_logging()
         
-        self.device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-        print(f"YOLO Device: {self.device.upper()}")
+        self.setup_gpu()
         
         print("Loading YOLOv8 model...")
         self.yolo_model = YOLO('yolov8n.pt')
@@ -40,12 +56,26 @@ class ObjectDetectionPipeline:
             self.yolo_model.to(self.device)
         
         print("Loading MobileNetV3 model...")
-        tf.config.set_visible_devices([], 'GPU')  # Use CPU for TensorFlow
+        # Enable GPU for TensorFlow/MobileNet
+        self.setup_tensorflow_gpu()
         self.mobilenet_model = MobileNetV3Small(
             input_shape=(224, 224, 3),
             weights='imagenet',
             include_top=True
         )
+        
+        # Queue system for async processing
+        self.classification_queue = Queue(maxsize=max_queue_size)
+        self.results_queue = Queue(maxsize=max_queue_size * 2)
+        self.batch_size = batch_size
+        
+        # Thread safety
+        self.results_lock = Lock()
+        self.active_detections = {}  # Track active detections by ID
+        
+        # Processing control
+        self.running = False
+        self.classifier_thread = None
         
         # Target objects we're looking for
         self.target_objects = {
@@ -63,24 +93,62 @@ class ObjectDetectionPipeline:
         self.target_objects_found = 0
         self.classifications_performed = 0
         self.target_confirmations = 0
-        
-        # Simplified detection - no persistence to avoid multiple boxes
-        self.object_counter = 0  # Simple counter for unique object IDs
+        self.queue_stats = {
+            'max_queue_size': 0,
+            'total_queued': 0,
+            'total_processed': 0,
+            'avg_queue_time': 0
+        }
         
         self.logger.info("Models loaded successfully!")
+        self.logger.info(f"YOLO Device: {self.device.upper()}")
+        self.logger.info(f"TensorFlow/MobileNet Device: GPU Enabled")
+        self.logger.info(f"Queue max size: {max_queue_size}, Batch size: {batch_size}")
         self.logger.info(f"Target objects: {list(self.target_objects.keys())}")
+    
+    def setup_gpu(self):
+        """Setup GPU configuration for PyTorch (YOLO)"""
+        if torch.backends.mps.is_available():
+            self.device = 'mps'
+            print(f"✓ PyTorch GPU (MPS) available")
+        elif torch.cuda.is_available():
+            self.device = 'cuda'
+            print(f"✓ PyTorch GPU (CUDA) available")
+        else:
+            self.device = 'cpu'
+            print(f"⚠ Using CPU for PyTorch")
+    
+    def setup_tensorflow_gpu(self):
+        """Setup GPU configuration for TensorFlow (MobileNet)"""
+        # Try to enable GPU for TensorFlow
+        gpus = tf.config.list_physical_devices('GPU')
+        
+        if gpus:
+            try:
+                # Enable memory growth to avoid taking all GPU memory
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                print(f"TensorFlow GPU enabled: {len(gpus)} GPU(s) found")
+                self.logger.info(f"TensorFlow GPUs: {gpus}")
+            except RuntimeError as e:
+                print(f"TensorFlow GPU setup warning: {e}")
+        else:
+            # For macOS with MPS, TensorFlow might not detect GPU
+            # But we can still try to use Metal Performance Shaders indirectly
+            print(f"ℹ TensorFlow GPU not detected (normal on macOS)")
+            print(f"  MobileNet will use optimized CPU with potential Metal acceleration")
     
     def setup_logging(self):
         """Setup logging system"""
         os.makedirs('logs', exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        self.logger = logging.getLogger('ObjectDetectionPipeline')
+        self.logger = logging.getLogger('AsyncObjectDetectionPipeline')
         self.logger.setLevel(logging.INFO)
         self.logger.handlers.clear()
         
         # File handler
-        file_handler = logging.FileHandler(f'logs/object_detection_{timestamp}.log')
+        file_handler = logging.FileHandler(f'logs/async_object_detection_{timestamp}.log')
         file_handler.setLevel(logging.INFO)
         
         # Console handler
@@ -94,13 +162,11 @@ class ObjectDetectionPipeline:
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
         
-        print(f"Logging to: logs/object_detection_{timestamp}.log")
+        print(f"Logging to: logs/async_object_detection_{timestamp}.log")
     
     def detect_objects_yolo(self, frame):
         """Stage 1: Use YOLOv8 for object detection"""
         try:
-            # Run YOLO detection
-            self.logger.info("STAGE 1: Running YOLOv8 detection...")
             results = self.yolo_model(
                 frame,
                 conf=self.yolo_confidence,
@@ -119,18 +185,16 @@ class ObjectDetectionPipeline:
             if hasattr(result, 'boxes') and result.boxes is not None:
                 boxes = result.boxes
                 
-                # First pass: collect all detections
                 raw_detections = []
                 for i, box in enumerate(boxes):
-                    # Extract bounding box coordinates
                     x1, y1, x2, y2 = map(int, box.xyxy[0].cpu())
                     confidence = float(box.conf[0].cpu())
                     class_id = int(box.cls[0].cpu())
                     class_name = self.yolo_model.names[class_id]
                     
-                    # Skip very small detections
-                    if (x2 - x1) < 30 or (y2 - y1) < 30:
-                        continue
+                    # # Skip very small detections
+                    # if (x2 - x1) < 30 or (y2 - y1) < 30:
+                    #     continue
                     
                     raw_detections.append({
                         'bbox': (x1, y1, x2, y2),
@@ -139,7 +203,7 @@ class ObjectDetectionPipeline:
                         'class_id': class_id
                     })
                 
-                # Second pass: deduplicate overlapping detections
+                # Deduplicate overlapping detections
                 detections = self.deduplicate_detections(raw_detections)
             
             return detections
@@ -153,22 +217,17 @@ class ObjectDetectionPipeline:
         if not raw_detections:
             return []
         
-        # Sort by confidence (highest first)
         sorted_detections = sorted(raw_detections, key=lambda x: x['confidence'], reverse=True)
-        
         filtered_detections = []
         
         for detection in sorted_detections:
             x1, y1, x2, y2 = detection['bbox']
-            class_name = detection['class_name']
-            confidence = detection['confidence']
-            
-            # Check if this detection overlaps significantly with ANY already accepted detection
             is_duplicate = False
+            
             for accepted in filtered_detections:
                 ax1, ay1, ax2, ay2 = accepted['bbox']
                 
-                # Calculate intersection over union (IoU)
+                # Calculate IoU
                 intersection_x1 = max(x1, ax1)
                 intersection_y1 = max(y1, ay1)
                 intersection_x2 = min(x2, ax2)
@@ -181,64 +240,155 @@ class ObjectDetectionPipeline:
                     union_area = box_area + accepted_area - intersection_area
                     iou = intersection_area / union_area if union_area > 0 else 0
                     
-                    # Much more aggressive IoU threshold - any significant overlap
                     if iou > 0.3:
                         is_duplicate = True
-                        self.logger.info(f"Filtered duplicate {class_name} detection (IoU: {iou:.3f})")
                         break
             
             if not is_duplicate:
                 filtered_detections.append(detection)
-                self.logger.info(f"YOLO detected: {class_name} ({confidence:.3f}) at [{x1},{y1},{x2},{y2}]")
                 
-                # Limit to maximum 3 detections to prevent clutter
                 if len(filtered_detections) >= 3:
-                    self.logger.info("Reached maximum detection limit (3)")
                     break
         
         return filtered_detections
     
-    def classify_with_mobilenet(self, cropped_image):
-        """Stage 2: Use MobileNetV3 for classification"""
+    def queue_for_classification(self, frame, detection, detection_id, timestamp):
+        """Queue a detected object for MobileNet classification"""
         try:
-            # Resize to MobileNet input size
-            resized_image = cv2.resize(cropped_image, (224, 224))
+            x1, y1, x2, y2 = detection['bbox']
+            cropped_obj = frame[y1:y2, x1:x2]
             
-            # Convert BGR to RGB
-            rgb_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2RGB)
+            if cropped_obj.size == 0:
+                return False
             
-            # Convert to PIL and preprocess
-            pil_image = PILImage.fromarray(rgb_image)
-            img_array = image.img_to_array(pil_image)
-            img_array = np.expand_dims(img_array, axis=0)
-            img_array = preprocess_input(img_array)
+            # Create classification task
+            task = {
+                'detection_id': detection_id,
+                'cropped_image': cropped_obj.copy(),
+                'bbox': detection['bbox'],
+                'yolo_class': detection['class_name'],
+                'yolo_confidence': detection['confidence'],
+                'timestamp': timestamp,
+                'queued_at': time.time()
+            }
             
-            # Make prediction
-            with tf.device('/CPU:0'):
-                predictions = self.mobilenet_model.predict(img_array, verbose=0)
+            # Try to add to queue (non-blocking)
+            if not self.classification_queue.full():
+                self.classification_queue.put(task, block=False)
+                self.queue_stats['total_queued'] += 1
+                
+                # Track queue size
+                current_size = self.classification_queue.qsize()
+                if current_size > self.queue_stats['max_queue_size']:
+                    self.queue_stats['max_queue_size'] = current_size
+                
+                return True
+            else:
+                self.logger.warning("Classification queue full, skipping detection")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Error queueing detection: {e}")
+            return False
+    
+    def classify_batch(self, batch_tasks):
+        """Classify a batch of cropped images with MobileNet"""
+        if not batch_tasks:
+            return []
+        
+        try:
+            # Prepare batch
+            batch_images = []
+            for task in batch_tasks:
+                # Resize and preprocess
+                resized_image = cv2.resize(task['cropped_image'], (224, 224))
+                rgb_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2RGB)
+                pil_image = PILImage.fromarray(rgb_image)
+                img_array = image.img_to_array(pil_image)
+                img_array = preprocess_input(img_array)
+                batch_images.append(img_array)
             
-            # Decode predictions
-            decoded_predictions = decode_predictions(predictions, top=3)[0]
+            # Stack into batch - use np.array to preserve shape (batch_size, 224, 224, 3)
+            batch_array = np.array(batch_images)
             
-            # Log top predictions
-            self.logger.info("MobileNetV3 top predictions:")
-            for i, (class_id, class_name, confidence) in enumerate(decoded_predictions):
-                self.logger.info(f"  {i+1}. {class_name}: {confidence:.3f}")
+            # Run batch prediction on GPU
+            predictions = self.mobilenet_model.predict(batch_array, verbose=0)
             
-            # Return the top prediction
-            if decoded_predictions:
-                top_prediction = decoded_predictions[0]
-                return {
-                    'class': top_prediction[1],
-                    'confidence': top_prediction[2],
-                    'all_predictions': decoded_predictions
-                }
+            # Process results
+            results = []
+            for i, task in enumerate(batch_tasks):
+                pred = predictions[i:i+1]
+                decoded = decode_predictions(pred, top=3)[0]
+                
+                if decoded:
+                    top_prediction = decoded[0]
+                    result = {
+                        'detection_id': task['detection_id'],
+                        'bbox': task['bbox'],
+                        'yolo_class': task['yolo_class'],
+                        'yolo_confidence': task['yolo_confidence'],
+                        'mobilenet_class': top_prediction[1],
+                        'mobilenet_confidence': top_prediction[2],
+                        'all_predictions': decoded,
+                        'timestamp': task['timestamp'],
+                        'queue_time': time.time() - task['queued_at']
+                    }
+                    results.append(result)
+                    self.classifications_performed += 1
             
-            return None
+            return results
             
         except Exception as e:
-            self.logger.error(f"MobileNetV3 classification error: {e}")
-            return None
+            self.logger.error(f"Batch classification error: {e}")
+            return []
+    
+    def classification_worker(self):
+        """Background worker thread for processing classification queue"""
+        self.logger.info("Classification worker thread started")
+        batch_buffer = []
+        last_process_time = time.time()
+        batch_timeout = 0.05  # 50ms timeout to process partial batches
+        
+        while self.running:
+            try:
+                # Try to get items from queue
+                try:
+                    task = self.classification_queue.get(timeout=0.01)
+                    batch_buffer.append(task)
+                except Empty:
+                    pass
+                
+                current_time = time.time()
+                time_since_last_process = current_time - last_process_time
+                
+                # Process batch if:
+                # 1. Buffer is full (reached batch_size)
+                # 2. Buffer has items and timeout reached
+                # 3. Queue is empty but buffer has items
+                should_process = (
+                    len(batch_buffer) >= self.batch_size or
+                    (len(batch_buffer) > 0 and time_since_last_process >= batch_timeout) or
+                    (len(batch_buffer) > 0 and self.classification_queue.empty())
+                )
+                
+                if should_process and batch_buffer:
+                    # Process batch
+                    results = self.classify_batch(batch_buffer)
+                    
+                    # Add results to results queue
+                    for result in results:
+                        self.results_queue.put(result)
+                        self.queue_stats['total_processed'] += 1
+                    
+                    self.logger.info(f"Processed batch of {len(batch_buffer)} objects")
+                    batch_buffer.clear()
+                    last_process_time = current_time
+                
+            except Exception as e:
+                self.logger.error(f"Classification worker error: {e}")
+                batch_buffer.clear()
+        
+        self.logger.info("Classification worker thread stopped")
     
     def is_target_object(self, class_name):
         """Check if the classified object is one of our target objects"""
@@ -251,290 +401,65 @@ class ObjectDetectionPipeline:
         
         return False, None
     
-    def smooth_coordinates(self, object_key, x1, y1, x2, y2):
-        """Apply temporal smoothing to bounding box coordinates"""
-        if object_key not in self.coordinate_history:
-            self.coordinate_history[object_key] = []
+    def get_processed_results(self):
+        """Get all processed classification results from queue"""
+        results = []
         
-        # Add new coordinates
-        coords = {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2}
-        self.coordinate_history[object_key].append(coords)
-        
-        # Keep only recent history
-        if len(self.coordinate_history[object_key]) > self.history_size:
-            self.coordinate_history[object_key] = self.coordinate_history[object_key][-self.history_size:]
-        
-        # If we have enough samples, use weighted average (more weight to recent frames)
-        if len(self.coordinate_history[object_key]) >= 3:
-            total_weight = 0
-            weighted_x1 = 0
-            weighted_y1 = 0
-            weighted_x2 = 0
-            weighted_y2 = 0
-            
-            for i, c in enumerate(self.coordinate_history[object_key]):
-                # Give more weight to recent frames
-                weight = 2 ** i
-                total_weight += weight
-                weighted_x1 += c['x1'] * weight
-                weighted_y1 += c['y1'] * weight
-                weighted_x2 += c['x2'] * weight
-                weighted_y2 += c['y2'] * weight
-            
-            avg_x1 = weighted_x1 / total_weight
-            avg_y1 = weighted_y1 / total_weight
-            avg_x2 = weighted_x2 / total_weight
-            avg_y2 = weighted_y2 / total_weight
-            
-            return int(avg_x1), int(avg_y1), int(avg_x2), int(avg_y2)
-        
-        # If not enough samples, return current coordinates
-        return x1, y1, x2, y2
-    
-    def smooth_confidence(self, object_key, confidence):
-        """Apply temporal smoothing to confidence values"""
-        if object_key not in self.confidence_history:
-            self.confidence_history[object_key] = []
-        
-        # Add new confidence
-        self.confidence_history[object_key].append(confidence)
-        
-        # Keep only recent history
-        if len(self.confidence_history[object_key]) > self.history_size:
-            self.confidence_history[object_key] = self.confidence_history[object_key][-self.history_size:]
-        
-        # If we have enough samples, use weighted average
-        if len(self.confidence_history[object_key]) >= 3:
-            total_weight = 0
-            weighted_confidence = 0
-            
-            for i, conf in enumerate(self.confidence_history[object_key]):
-                weight = 2 ** i
-                total_weight += weight
-                weighted_confidence += conf * weight
-            
-            return weighted_confidence / total_weight
-        
-        # If not enough samples, return current confidence
-        return confidence
-    
-    def smooth_classification(self, object_key, result):
-        """Apply temporal smoothing to classification results"""
-        if object_key not in self.object_history:
-            self.object_history[object_key] = []
-        
-        # Add new result
-        self.object_history[object_key].append(result)
-        
-        # Keep only recent history
-        if len(self.object_history[object_key]) > self.history_size:
-            self.object_history[object_key] = self.object_history[object_key][-self.history_size:]
-        
-        # If we have enough samples, find the most common classification
-        if len(self.object_history[object_key]) >= 3:
-            # Count classifications
-            classifications = [r['is_target'] for r in self.object_history[object_key]]
-            target_count = sum(classifications)
-            
-            # If majority are targets, use the most recent target result
-            if target_count >= len(classifications) * 0.6:
-                for r in reversed(self.object_history[object_key]):
-                    if r['is_target']:
-                        return r
-            else:
-                # If majority are non-targets, use the most recent non-target result
-                for r in reversed(self.object_history[object_key]):
-                    if not r['is_target']:
-                        return r
-        
-        # If not enough samples, return the most recent
-        return self.object_history[object_key][-1]
-    
-    def get_persistent_objects(self, current_frame):
-        """Get objects that should still be shown based on persistence"""
-        persistent_objects = []
-        
-        for object_key, last_seen_frame in self.object_persistence.items():
-            # If object was seen recently (within persistence_frames), include it
-            if current_frame - last_seen_frame <= self.persistence_frames:
-                # Get the most recent data for this object
-                if object_key in self.coordinate_history and len(self.coordinate_history[object_key]) > 0:
-                    coords = self.coordinate_history[object_key][-1]
-                    confidence = self.confidence_history.get(object_key, [0.5])[-1] if object_key in self.confidence_history else 0.5
-                    result = self.object_history.get(object_key, [{'is_target': False, 'target_type': None}])[-1] if object_key in self.object_history else {'is_target': False, 'target_type': None}
-                    
-                    persistent_objects.append({
-                        'object_key': object_key,
-                        'coords': coords,
-                        'confidence': confidence,
-                        'result': result,
-                        'frames_since_seen': current_frame - last_seen_frame
-                    })
-        
-        return persistent_objects
-    
-    def process_detection(self, frame, detection, frame_count):
-        """Process a single detection through the pipeline - simplified version"""
-        x1, y1, x2, y2 = detection['bbox']
-        yolo_class = detection['class_name']
-        yolo_confidence = detection['confidence']
-        
-        # Crop the detected object
-        cropped_obj = frame[y1:y2, x1:x2]
-        
-        if cropped_obj.size == 0:
-            return None
-        
-        # Stage 2: Classify with MobileNetV3
-        self.logger.info(f"STAGE 2: Sending {yolo_class} to MobileNetV3 for classification...")
-        self.classifications_performed += 1
-        classification_result = self.classify_with_mobilenet(cropped_obj)
-        
-        result = {
-            'bbox': (x1, y1, x2, y2),
-            'yolo_class': yolo_class,
-            'yolo_confidence': yolo_confidence,
-            'mobilenet_classification': classification_result,
-            'is_target': False,
-            'target_type': None,
-            'final_confidence': yolo_confidence
-        }
-        
-        # Determine if this is what we're looking for
-        if classification_result:
-            mobilenet_class = classification_result['class']
-            mobilenet_confidence = classification_result['confidence']
-            
-            is_target, target_type = self.is_target_object(mobilenet_class)
-            
-            if is_target:
-                result['is_target'] = True
+        try:
+            while not self.results_queue.empty():
+                result = self.results_queue.get_nowait()
+                
+                # Check if it's a target object
+                is_target, target_type = self.is_target_object(result['mobilenet_class'])
+                result['is_target'] = is_target
                 result['target_type'] = target_type
-                result['final_confidence'] = (yolo_confidence + mobilenet_confidence) / 2
-                self.target_confirmations += 1
-                self.logger.info(f"TARGET CONFIRMED: {target_type} (YOLO: {yolo_class}, MobileNet: {mobilenet_class})")
-            else:
-                self.logger.info(f"Not a target: YOLO={yolo_class}, MobileNet={mobilenet_class}")
+                
+                if is_target:
+                    self.target_confirmations += 1
+                    self.logger.info(f"TARGET CONFIRMED: {target_type} - {result['mobilenet_class']}")
+                
+                results.append(result)
+                
+        except Empty:
+            pass
         
-        # Return result directly - no smoothing or persistence
-        return result
+        return results
     
-    def draw_persistent_results(self, frame, persistent_objects):
-        """Draw persistent detection results on frame (anti-flickering)"""
-        for persistent_obj in persistent_objects:
-            coords = persistent_obj['coords']
-            confidence = persistent_obj['confidence']
-            result = persistent_obj['result']
-            frames_since_seen = persistent_obj['frames_since_seen']
+    def draw_detections(self, frame, detections):
+        """Draw detection results on frame"""
+        for detection in detections:
+            x1, y1, x2, y2 = detection['bbox']
             
-            x1, y1, x2, y2 = coords['x1'], coords['y1'], coords['x2'], coords['y2']
-            
-            # Choose color based on whether it's a target
-            if result['is_target']:
+            # Determine if target object
+            if detection.get('is_target', False):
                 color = (0, 255, 0)  # Green for targets
                 thickness = 3
-                label = f"TARGET: {result['target_type'].upper()}"
+                label = f"TARGET: {detection['target_type'].upper()}"
             else:
-                color = (0, 0, 255)  # Red for non-targets
+                color = (0, 165, 255)  # Orange for pending classification
                 thickness = 2
-                label = f"NON-TARGET: {result['yolo_class']}"
-            
-            # Make boxes slightly transparent if they're old detections
-            if frames_since_seen > 0:
-                alpha = 0.7  # Make older detections slightly transparent
-                overlay = frame.copy()
-                cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness)
-                cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-            else:
-                # Draw bounding box for current detections
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-            
-            # Draw label
-            cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            
-            # Draw confidence
-            conf_text = f"Conf: {confidence:.2f}"
-            if frames_since_seen > 0:
-                conf_text += f" ({frames_since_seen}f ago)"
-            cv2.putText(frame, conf_text, (x1, y2+20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            
-            # Draw MobileNet classification if available
-            if result.get('mobilenet_classification'):
-                mobilenet_class = result['mobilenet_classification']['class']
-                mobilenet_conf = result['mobilenet_classification']['confidence']
-                mobile_text = f"MobileNet: {mobilenet_class} ({mobilenet_conf:.2f})"
-                cv2.putText(frame, mobile_text, (x1, y2+40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-    
-    def draw_current_detections(self, frame, detections):
-        """Draw only current detections with clear pipeline visualization"""
-        for i, result in enumerate(detections):
-            x1, y1, x2, y2 = result['bbox']
-            
-            # Choose color based on whether it's a target
-            if result['is_target']:
-                color = (0, 255, 0)  # Green for targets
-                thickness = 3
-                final_label = f"TARGET: {result['target_type'].upper()}"
-            else:
-                color = (0, 0, 255)  # Red for non-targets
-                thickness = 2
-                final_label = f"NON-TARGET: {result['yolo_class']}"
+                label = f"YOLO: {detection['yolo_class']}"
             
             # Draw bounding box
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
             
-            # Draw pipeline stage indicator
-            stage_text = f"[{i+1}] YOLO→MobileNet Pipeline"
-            cv2.putText(frame, stage_text, (x1, y1-50), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            
-            # Draw YOLO detection info (Stage 1) - Black text
-            yolo_text = f"STAGE 1 - YOLO: {result['yolo_class']} ({result['yolo_confidence']:.2f})"
+            # Draw YOLO info
+            yolo_text = f"YOLO: {detection['yolo_class']} ({detection['yolo_confidence']:.2f})"
             cv2.putText(frame, yolo_text, (x1, y1-30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
             
-            # Draw MobileNet classification info (Stage 2) - Dark blue text
-            if result.get('mobilenet_classification'):
-                mobilenet_class = result['mobilenet_classification']['class']
-                mobilenet_conf = result['mobilenet_classification']['confidence']
-                mobile_text = f"STAGE 2 - MobileNet: {mobilenet_class} ({mobilenet_conf:.2f})"
+            # Draw MobileNet info if available
+            if 'mobilenet_class' in detection:
+                mobile_text = f"MobileNet: {detection['mobilenet_class']} ({detection['mobilenet_confidence']:.2f})"
                 cv2.putText(frame, mobile_text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (139, 0, 0), 1)
-            
-            # Draw final result
-            cv2.putText(frame, final_label, (x1, y2+20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-    
-    def draw_results(self, frame, results):
-        """Draw detection results on frame (legacy method - kept for compatibility)"""
-        for result in results:
-            x1, y1, x2, y2 = result['bbox']
-            
-            # Choose color based on whether it's a target
-            if result['is_target']:
-                color = (0, 255, 0)  # Green for targets
-                thickness = 3
-                label = f"TARGET: {result['target_type'].upper()}"
+                
+                # Draw final label
+                cv2.putText(frame, label, (x1, y2+20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             else:
-                color = (0, 0, 255)  # Red for non-targets
-                thickness = 2
-                label = f"NON-TARGET: {result['yolo_class']}"
-            
-            # Draw bounding box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-            
-            # Draw label
-            cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            
-            # Draw confidence
-            conf_text = f"Conf: {result['final_confidence']:.2f}"
-            cv2.putText(frame, conf_text, (x1, y2+20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            
-            # Draw MobileNet classification if available
-            if result['mobilenet_classification']:
-                mobilenet_class = result['mobilenet_classification']['class']
-                mobilenet_conf = result['mobilenet_classification']['confidence']
-                mobile_text = f"MobileNet: {mobilenet_class} ({mobilenet_conf:.2f})"
-                cv2.putText(frame, mobile_text, (x1, y2+40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                # Show "Processing..." for queued items
+                cv2.putText(frame, "Processing...", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
     
     def run_detection(self):
-        """Main detection loop"""
+        """Main detection loop with async processing"""
         print("Opening camera...")
         cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
         
@@ -551,103 +476,211 @@ class ObjectDetectionPipeline:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"Camera initialized: {width}x{height}")
         
-        print("Detection pipeline running! Press 'q' to quit")
+        # Start classification worker thread
+        self.running = True
+        self.classifier_thread = Thread(target=self.classification_worker, daemon=True)
+        self.classifier_thread.start()
+        
+        print("Async detection pipeline running! Press 'q' to quit")
         print("=" * 60)
         
         frame_count = 0
         fps_counter = 0
         fps_start_time = time.time()
         
+        # Smooth FPS calculation using rolling average
+        fps_history = deque(maxlen=30)  # Keep last 30 FPS measurements
+        current_fps = 0
+        
         # Detection timing control
         last_detection_time = 0
         detection_interval = 0.1  # 100ms = 10 times per second
-        current_detections = []  # Store current detections for drawing
         
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("Failed to read frame")
-                break
-            
-            frame_count += 1
-            current_time = time.time()
-            
-            # Run detection exactly 10 times per second (every 100ms)
-            if current_time - last_detection_time >= detection_interval:
-                self.logger.info("STARTING TWO-STAGE PIPELINE...")
+        # Active detections tracking
+        active_detections = {}  # detection_id -> detection_info
+        detection_ttl = 2.0  # Keep detections for 2 seconds max
+        
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    print("Failed to read frame")
+                    break
                 
-                # Stage 1: YOLOv8 Detection
-                detections = self.detect_objects_yolo(frame)
+                frame_count += 1
+                current_time = time.time()
                 
-                # Process each detection and store for drawing
-                current_detections = []  # Reset current detections
-                for detection in detections:
-                    result = self.process_detection(frame, detection, frame_count)
-                    if result:
-                        current_detections.append(result)
+                # Clean up old detections (expired after TTL)
+                expired_ids = [
+                    det_id for det_id, det in active_detections.items()
+                    if current_time - det['timestamp'] > detection_ttl
+                ]
+                for det_id in expired_ids:
+                    del active_detections[det_id]
+                
+                # Run YOLO detection at controlled interval
+                if current_time - last_detection_time >= detection_interval:
+                    # Stage 1: YOLO Detection
+                    detections = self.detect_objects_yolo(frame)
+                    
+                    # Add new detections (don't clear old ones that are still being processed)
+                    for detection in detections:
+                        detection_id = str(uuid.uuid4())
+                        
+                        # Store detection info
+                        active_detections[detection_id] = {
+                            'bbox': detection['bbox'],
+                            'yolo_class': detection['class_name'],
+                            'yolo_confidence': detection['confidence'],
+                            'timestamp': current_time,
+                            'classified': False  # Track if classification is complete
+                        }
+                        
+                        # Queue for classification
+                        self.queue_for_classification(
+                            frame, detection, detection_id, current_time
+                        )
+                        
                         self.total_detections += 1
+                    
+                    last_detection_time = current_time
+                
+                # Get processed classification results
+                processed_results = self.get_processed_results()
+                
+                # Update active detections with classification results
+                for result in processed_results:
+                    detection_id = result['detection_id']
+                    if detection_id in active_detections:
+                        active_detections[detection_id].update({
+                            'mobilenet_class': result['mobilenet_class'],
+                            'mobilenet_confidence': result['mobilenet_confidence'],
+                            'is_target': result['is_target'],
+                            'target_type': result['target_type'],
+                            'queue_time': result['queue_time'],
+                            'classified': True  # Mark as classified
+                        })
+                        
                         if result['is_target']:
                             self.target_objects_found += 1
                 
-                self.logger.info(f"PIPELINE COMPLETE: {len(current_detections)} objects processed")
-                last_detection_time = current_time
-            
-            # Draw only current detections (no persistence to avoid multiple boxes)
-            self.draw_current_detections(frame, current_detections)
-            
-            # Calculate and display FPS
-            fps_counter += 1
-            if time.time() - fps_start_time >= 1.0:
-                fps = fps_counter
-                fps_counter = 0
-                fps_start_time = time.time()
+                # Draw only the most recent classified detection for each bbox area
+                # This prevents overlapping "Processing..." and classification text
+                detections_to_draw = []
+                drawn_areas = []
                 
-                # Display stats
-                stats_text = f"FPS: {fps} | Detections: {self.total_detections} | Targets: {self.target_objects_found}"
-                cv2.putText(frame, stats_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                # Sort by timestamp (newest first) and classification status (classified first)
+                sorted_detections = sorted(
+                    active_detections.items(),
+                    key=lambda x: (x[1].get('classified', False), x[1]['timestamp']),
+                    reverse=True
+                )
+                
+                for det_id, det in sorted_detections:
+                    bbox = det['bbox']
+                    x1, y1, x2, y2 = bbox
+                    
+                    # Check if this area already has a detection drawn
+                    overlaps = False
+                    for drawn_bbox in drawn_areas:
+                        dx1, dy1, dx2, dy2 = drawn_bbox
+                        # Calculate overlap
+                        overlap_x1 = max(x1, dx1)
+                        overlap_y1 = max(y1, dy1)
+                        overlap_x2 = min(x2, dx2)
+                        overlap_y2 = min(y2, dy2)
+                        
+                        if overlap_x1 < overlap_x2 and overlap_y1 < overlap_y2:
+                            overlap_area = (overlap_x2 - overlap_x1) * (overlap_y2 - overlap_y1)
+                            bbox_area = (x2 - x1) * (y2 - y1)
+                            if overlap_area / bbox_area > 0.5:  # 50% overlap
+                                overlaps = True
+                                break
+                    
+                    if not overlaps:
+                        detections_to_draw.append(det)
+                        drawn_areas.append(bbox)
+                
+                self.draw_detections(frame, detections_to_draw)
+                
+                # Calculate and display FPS with smooth rolling average
+                fps_counter += 1
+                current_time_for_fps = time.time()
+                
+                if current_time_for_fps - fps_start_time >= 1.0:
+                    # Calculate current FPS
+                    instant_fps = fps_counter
+                    fps_history.append(instant_fps)
+                    
+                    # Calculate rolling average FPS
+                    current_fps = sum(fps_history) / len(fps_history)
+                    
+                    # Reset counters
+                    fps_counter = 0
+                    fps_start_time = current_time_for_fps
+                
+                # Display stats with smooth FPS
+                queue_size = self.classification_queue.qsize()
+                stats_text = f"FPS: {current_fps:.1f} | Queue: {queue_size} | Detections: {self.total_detections} | Targets: {self.target_objects_found}"
+                cv2.putText(frame, stats_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                
+                # Pipeline info
+                cv2.putText(frame, "ASYNC PIPELINE: YOLO (GPU) → Queue → MobileNet Batch (GPU)", 
+                           (10, height-80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame, "GREEN: Target Objects | ORANGE: Processing", 
+                           (10, height-60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame, f"Batch Size: {self.batch_size} | Max Queue: {self.queue_stats['max_queue_size']}", 
+                           (10, height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame, f"Processed: {self.queue_stats['total_processed']} | Confirmations: {self.target_confirmations}", 
+                           (10, height-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                
+                # Display frame
+                cv2.imshow('Async Object Detection Pipeline', frame)
+                
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+        
+        finally:
+            # Cleanup
+            self.running = False
+            if self.classifier_thread:
+                self.classifier_thread.join(timeout=2.0)
             
-            # Pipeline Legend
-            cv2.putText(frame, "TWO-STAGE PIPELINE: YOLOv8 (Detection) → MobileNetV3 (Classification)", 
-                       (10, height-60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(frame, "GREEN: Target Objects | RED: Non-Target Objects", 
-                       (10, height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(frame, "BLACK: YOLO Results | DARK BLUE: MobileNet Results", 
-                       (10, height-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cap.release()
+            cv2.destroyAllWindows()
             
-            # Display frame
-            cv2.imshow('Object Detection & Classification Pipeline', frame)
+            # Final statistics
+            print("\n" + "=" * 60)
+            print("ASYNC PIPELINE SUMMARY")
+            print("=" * 60)
+            print(f"Total detections: {self.total_detections}")
+            print(f"Target objects found: {self.target_objects_found}")
+            print(f"Classifications performed: {self.classifications_performed}")
+            print(f"Target confirmations: {self.target_confirmations}")
+            print(f"Max queue size reached: {self.queue_stats['max_queue_size']}")
+            print(f"Total queued: {self.queue_stats['total_queued']}")
+            print(f"Total processed: {self.queue_stats['total_processed']}")
             
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        
-        # Cleanup
-        cap.release()
-        cv2.destroyAllWindows()
-        
-        # Final statistics
-        print("\n" + "=" * 60)
-        print("DETECTION PIPELINE SUMMARY")
-        print("=" * 60)
-        print(f"Total detections: {self.total_detections}")
-        print(f"Target objects found: {self.target_objects_found}")
-        print(f"Classifications performed: {self.classifications_performed}")
-        print(f"Target confirmations: {self.target_confirmations}")
-        
-        if self.total_detections > 0:
-            target_rate = (self.target_objects_found / self.total_detections) * 100
-            print(f"Target detection rate: {target_rate:.1f}%")
-        
-        print("=" * 60)
+            if self.total_detections > 0:
+                target_rate = (self.target_objects_found / self.total_detections) * 100
+                print(f"Target detection rate: {target_rate:.1f}%")
+            
+            print("=" * 60)
 
 def main():
     """Main function"""
     try:
-        detector = ObjectDetectionPipeline()
+        # You can adjust these parameters:
+        # - max_queue_size: Maximum number of items in classification queue
+        # - batch_size: Number of images to classify together (GPU batch processing)
+        detector = AsyncObjectDetectionPipeline(max_queue_size=30, batch_size=4)
         detector.run_detection()
     except KeyboardInterrupt:
         print("\nDetection stopped by user")
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()

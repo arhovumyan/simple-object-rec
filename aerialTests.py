@@ -97,6 +97,14 @@ class AsyncObjectDetectionPipeline:
         self.input_resolution = 1280  # Higher resolution for better small object detection
         self.enhance_small_objects = True  # Apply image enhancement for small objects
         
+        # Aerial surveillance settings (150ft altitude)
+        self.aerial_mode = True
+        self.drone_altitude = 150  # feet
+        self.aerial_confidence_threshold = 0.15  # Lower threshold for aerial detection
+        self.aerial_min_box_size = 8  # Even smaller for aerial objects
+        self.max_aerial_detections = 50  # More detections for aerial coverage
+        self.aerial_scales = [1.0, 1.5, 2.0, 3.0]  # More scales for aerial detection
+        
         # Adaptive detection settings
         self.motion_threshold = 1000  # Motion detection threshold
         self.static_frame_count = 0   # Count of static frames
@@ -112,9 +120,14 @@ class AsyncObjectDetectionPipeline:
         # Object tracking system
         self.tracked_objects = {}  # track_id -> object_info
         self.next_track_id = 1
-        self.max_track_age = 10  # Max frames to keep inactive tracks
-        self.min_track_hits = 3  # Min hits before showing track
-        self.tracking_threshold = 0.3  # IoU threshold for tracking
+        self.max_track_age = 15  # Longer for aerial (drone movement)
+        self.min_track_hits = 2  # Fewer hits needed for aerial (less stable)
+        self.tracking_threshold = 0.2  # Lower threshold for aerial tracking
+        
+        # Aerial-specific tracking
+        self.aerial_tracking_enabled = True
+        self.drone_movement_compensation = True
+        self.aerial_detection_zones = []  # For systematic coverage
         
         # Statistics
         self.total_detections = 0
@@ -193,72 +206,69 @@ class AsyncObjectDetectionPipeline:
         print(f"Logging to: logs/async_object_detection_{timestamp}.log")
     
     def detect_objects_yolo(self, frame):
-        """Stage 1: Use YOLOv8 for object detection with multi-scale support"""
+        """Stage 1: Use YOLOv8 for object detection with aerial-optimized multi-scale support"""
         try:
-            # Multi-scale detection for small objects
+            # Aerial-optimized multi-scale detection
             all_detections = []
             
+            if self.aerial_mode:
+                # Use aerial-specific settings
+                scales = self.aerial_scales
+                base_conf = self.aerial_confidence_threshold
+                max_det = self.max_aerial_detections
+                min_size = self.aerial_min_box_size
+            else:
+                # Use regular settings
+                scales = [1.0, 1.5, 2.0]
+                base_conf = self.yolo_confidence
+                max_det = self.max_detections
+                min_size = self.min_box_size
+            
             if self.multi_scale_detection:
-                # Original scale
-                results1 = self.yolo_model(
-                    frame,
-                    conf=self.yolo_confidence,
-                    iou=0.5,
-                    max_det=self.max_detections,
-                    verbose=False,
-                    device=self.device
-                )
-                if results1 and len(results1) > 0:
-                    all_detections.extend(self._process_yolo_results(results1, frame.shape))
-                
-                # Higher resolution for small objects (1.5x scale)
                 height, width = frame.shape[:2]
-                scaled_frame = cv2.resize(frame, (int(width * 1.5), int(height * 1.5)))
-                results2 = self.yolo_model(
-                    scaled_frame,
-                    conf=self.yolo_confidence * 0.8,  # Slightly lower confidence for scaled detection
-                    iou=0.5,
-                    max_det=self.max_detections,
-                    verbose=False,
-                    device=self.device
-                )
-                if results2 and len(results2) > 0:
-                    scaled_detections = self._process_yolo_results(results2, scaled_frame.shape)
-                    # Scale coordinates back to original frame
-                    for detection in scaled_detections:
-                        x1, y1, x2, y2 = detection['bbox']
-                        detection['bbox'] = (int(x1/1.5), int(y1/1.5), int(x2/1.5), int(y2/1.5))
-                    all_detections.extend(scaled_detections)
                 
-                # Even higher resolution for very small objects (2x scale)
-                scaled_frame2 = cv2.resize(frame, (int(width * 2), int(height * 2)))
-                results3 = self.yolo_model(
-                    scaled_frame2,
-                    conf=self.yolo_confidence * 0.7,  # Lower confidence for 2x scale
-                    iou=0.5,
-                    max_det=self.max_detections,
-                    verbose=False,
-                    device=self.device
-                )
-                if results3 and len(results3) > 0:
-                    scaled_detections2 = self._process_yolo_results(results3, scaled_frame2.shape)
-                    # Scale coordinates back to original frame
-                    for detection in scaled_detections2:
-                        x1, y1, x2, y2 = detection['bbox']
-                        detection['bbox'] = (int(x1/2), int(y1/2), int(x2/2), int(y2/2))
-                    all_detections.extend(scaled_detections2)
+                for scale_idx, scale in enumerate(scales):
+                    if scale == 1.0:
+                        # Original scale
+                        scaled_frame = frame
+                    else:
+                        # Scale up for better small object detection
+                        scaled_frame = cv2.resize(frame, (int(width * scale), int(height * scale)))
+                    
+                    # Adjust confidence based on scale (higher scales = lower confidence needed)
+                    scale_conf = base_conf * (1.0 - (scale_idx * 0.1))
+                    
+                    results = self.yolo_model(
+                        scaled_frame,
+                        conf=max(scale_conf, 0.05),  # Minimum confidence of 0.05
+                        iou=0.4,  # Slightly lower IoU for aerial
+                        max_det=max_det,
+                        verbose=False,
+                        device=self.device
+                    )
+                    
+                    if results and len(results) > 0:
+                        scale_detections = self._process_yolo_results(results, scaled_frame.shape, min_size)
+                        
+                        # Scale coordinates back to original frame
+                        if scale != 1.0:
+                            for detection in scale_detections:
+                                x1, y1, x2, y2 = detection['bbox']
+                                detection['bbox'] = (int(x1/scale), int(y1/scale), int(x2/scale), int(y2/scale))
+                        
+                        all_detections.extend(scale_detections)
             else:
                 # Single scale detection
                 results = self.yolo_model(
                     frame,
-                    conf=self.yolo_confidence,
-                    iou=0.5,
-                    max_det=self.max_detections,
+                    conf=base_conf,
+                    iou=0.4,
+                    max_det=max_det,
                     verbose=False,
                     device=self.device
                 )
                 if results and len(results) > 0:
-                    all_detections = self._process_yolo_results(results, frame.shape)
+                    all_detections = self._process_yolo_results(results, frame.shape, min_size)
             
             # Remove duplicates and merge results
             detections = self._merge_detections(all_detections)
@@ -268,10 +278,13 @@ class AsyncObjectDetectionPipeline:
             self.logger.error(f"YOLO detection error: {e}")
             return []
     
-    def _process_yolo_results(self, results, frame_shape):
+    def _process_yolo_results(self, results, frame_shape, min_box_size=None):
         """Process YOLO results into detection format"""
         detections = []
         result = results[0]
+        
+        if min_box_size is None:
+            min_box_size = self.min_box_size
         
         if hasattr(result, 'boxes') and result.boxes is not None:
             boxes = result.boxes
@@ -283,7 +296,7 @@ class AsyncObjectDetectionPipeline:
                 class_name = self.yolo_model.names[class_id]
                 
                 # Only filter extremely small detections
-                if (x2 - x1) < self.min_box_size or (y2 - y1) < self.min_box_size:
+                if (x2 - x1) < min_box_size or (y2 - y1) < min_box_size:
                     continue
                 
                 detections.append({
@@ -334,23 +347,51 @@ class AsyncObjectDetectionPipeline:
         return merged_detections
     
     def enhance_image_for_small_objects(self, frame):
-        """Enhance image to improve small object detection"""
+        """Enhance image to improve small object detection with aerial optimizations"""
         if not self.enhance_small_objects:
             return frame
         
         try:
-            # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            lab[:,:,0] = clahe.apply(lab[:,:,0])
-            enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-            
-            # Apply slight sharpening for small objects
-            kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-            sharpened = cv2.filter2D(enhanced, -1, kernel)
-            
-            # Blend original and enhanced image
-            result = cv2.addWeighted(frame, 0.7, sharpened, 0.3, 0)
+            if self.aerial_mode:
+                # Aerial-specific enhancement for 150ft altitude
+                
+                # Stronger CLAHE for aerial images (more contrast variation)
+                lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4))  # Smaller tiles for aerial
+                lab[:,:,0] = clahe.apply(lab[:,:,0])
+                enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+                
+                # Stronger sharpening for aerial small objects
+                kernel = np.array([[-2,-2,-2], [-2,17,-2], [-2,-2,-2]])
+                sharpened = cv2.filter2D(enhanced, -1, kernel)
+                
+                # Edge enhancement for aerial objects
+                gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
+                edges = cv2.Canny(gray, 50, 150)
+                edges_colored = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+                
+                # Combine all enhancements
+                result = cv2.addWeighted(enhanced, 0.6, sharpened, 0.3, 0)
+                result = cv2.addWeighted(result, 0.9, edges_colored, 0.1, 0)
+                
+                # Gamma correction for aerial visibility
+                gamma = 1.2
+                lookup_table = np.array([((i / 255.0) ** (1.0 / gamma)) * 255 for i in range(256)]).astype("uint8")
+                result = cv2.LUT(result, lookup_table)
+                
+            else:
+                # Regular enhancement for ground-based detection
+                lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+                lab[:,:,0] = clahe.apply(lab[:,:,0])
+                enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+                
+                # Apply slight sharpening for small objects
+                kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+                sharpened = cv2.filter2D(enhanced, -1, kernel)
+                
+                # Blend original and enhanced image
+                result = cv2.addWeighted(frame, 0.7, sharpened, 0.3, 0)
             
             return result
             
@@ -832,10 +873,21 @@ class AsyncObjectDetectionPipeline:
             print("Failed to open camera!")
             return
         
-        # Camera settings - higher resolution for better small object detection
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Camera settings - optimized for aerial surveillance at 150ft
+        if self.aerial_mode:
+            # Maximum resolution for aerial detection
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # Optimize for aerial conditions
+            cap.set(cv2.CAP_PROP_EXPOSURE, -6)  # Slightly underexposed for aerial
+            cap.set(cv2.CAP_PROP_CONTRAST, 120)  # Higher contrast
+            cap.set(cv2.CAP_PROP_SATURATION, 110)  # Slightly higher saturation
+        else:
+            # Regular settings for ground-based detection
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -846,7 +898,11 @@ class AsyncObjectDetectionPipeline:
         self.classifier_thread = Thread(target=self.classification_worker, daemon=True)
         self.classifier_thread.start()
         
-        print("Tracked Adaptive Async detection pipeline running! Press 'q' to quit")
+        if self.aerial_mode:
+            print("AERIAL SURVEILLANCE MODE - Tracked Adaptive Async detection pipeline running! Press 'q' to quit")
+            print(f"Optimized for drone operation at {self.drone_altitude}ft altitude")
+        else:
+            print("Tracked Adaptive Async detection pipeline running! Press 'q' to quit")
         print("=" * 60)
         
         frame_count = 0
@@ -947,18 +1003,34 @@ class AsyncObjectDetectionPipeline:
                 cv2.putText(frame, stats_text2, (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
                 
                 # Pipeline info
-                cv2.putText(frame, "TRACKED ASYNC PIPELINE: Motion → YOLO → Tracking → MobileNet → Results", 
-                           (10, height-120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(frame, "GREEN: Target Objects | RED: Non-Targets | ORANGE: Tracking", 
-                           (10, height-100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(frame, f"Motion Level: {motion_level:.0f} | Threshold: {self.motion_threshold}", 
-                           (10, height-80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(frame, f"Small Objects: Multi-scale | Min Size: {self.min_box_size}px", 
-                           (10, height-60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(frame, f"Batch Size: {self.batch_size} | Processed: {self.queue_stats['total_processed']}", 
-                           (10, height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(frame, f"Tracks Created: {total_tracks_created} | Confirmations: {self.target_confirmations}", 
-                           (10, height-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                if self.aerial_mode:
+                    cv2.putText(frame, "AERIAL SURVEILLANCE MODE (150ft) - Multi-Scale Detection", 
+                               (10, height-140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    cv2.putText(frame, "TRACKED ASYNC PIPELINE: Motion → YOLO → Tracking → MobileNet → Results", 
+                               (10, height-120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(frame, "GREEN: Target Objects | RED: Non-Targets | ORANGE: Tracking", 
+                               (10, height-100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(frame, f"Motion Level: {motion_level:.0f} | Threshold: {self.motion_threshold}", 
+                               (10, height-80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(frame, f"Aerial Detection: {len(self.aerial_scales)} scales | Min Size: {self.aerial_min_box_size}px", 
+                               (10, height-60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(frame, f"Confidence: {self.aerial_confidence_threshold} | Max Detections: {self.max_aerial_detections}", 
+                               (10, height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(frame, f"Tracks Created: {total_tracks_created} | Confirmations: {self.target_confirmations}", 
+                               (10, height-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                else:
+                    cv2.putText(frame, "TRACKED ASYNC PIPELINE: Motion → YOLO → Tracking → MobileNet → Results", 
+                               (10, height-120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(frame, "GREEN: Target Objects | RED: Non-Targets | ORANGE: Tracking", 
+                               (10, height-100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(frame, f"Motion Level: {motion_level:.0f} | Threshold: {self.motion_threshold}", 
+                               (10, height-80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(frame, f"Small Objects: Multi-scale | Min Size: {self.min_box_size}px", 
+                               (10, height-60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(frame, f"Batch Size: {self.batch_size} | Processed: {self.queue_stats['total_processed']}", 
+                               (10, height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.putText(frame, f"Tracks Created: {total_tracks_created} | Confirmations: {self.target_confirmations}", 
+                               (10, height-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 
                 # Display frame
                 cv2.imshow('Async Object Detection Pipeline', frame)
