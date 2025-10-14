@@ -29,20 +29,16 @@ class ObjectDetectionPipeline:
         print("Stage 2: MobileNetV3 Classification")
         print("=" * 60)
         
-        # Setup logging
         self.setup_logging()
         
-        # Setup devices
         self.device = 'mps' if torch.backends.mps.is_available() else 'cpu'
         print(f"YOLO Device: {self.device.upper()}")
         
-        # Load YOLOv8 model
         print("Loading YOLOv8 model...")
         self.yolo_model = YOLO('yolov8n.pt')
         if self.device == 'mps':
             self.yolo_model.to(self.device)
         
-        # Load MobileNetV3 model
         print("Loading MobileNetV3 model...")
         tf.config.set_visible_devices([], 'GPU')  # Use CPU for TensorFlow
         self.mobilenet_model = MobileNetV3Small(
@@ -104,7 +100,7 @@ class ObjectDetectionPipeline:
         """Stage 1: Use YOLOv8 for object detection"""
         try:
             # Run YOLO detection
-            self.logger.info("🔍 STAGE 1: Running YOLOv8 detection...")
+            self.logger.info("STAGE 1: Running YOLOv8 detection...")
             results = self.yolo_model(
                 frame,
                 conf=self.yolo_confidence,
@@ -390,7 +386,7 @@ class ObjectDetectionPipeline:
             return None
         
         # Stage 2: Classify with MobileNetV3
-        self.logger.info(f"🧠 STAGE 2: Sending {yolo_class} to MobileNetV3 for classification...")
+        self.logger.info(f"STAGE 2: Sending {yolo_class} to MobileNetV3 for classification...")
         self.classifications_performed += 1
         classification_result = self.classify_with_mobilenet(cropped_obj)
         
@@ -578,7 +574,7 @@ class ObjectDetectionPipeline:
             
             # Run detection exactly 10 times per second (every 100ms)
             if current_time - last_detection_time >= detection_interval:
-                self.logger.info("🚀 STARTING TWO-STAGE PIPELINE...")
+                self.logger.info("STARTING TWO-STAGE PIPELINE...")
                 
                 # Stage 1: YOLOv8 Detection
                 detections = self.detect_objects_yolo(frame)
@@ -593,7 +589,7 @@ class ObjectDetectionPipeline:
                         if result['is_target']:
                             self.target_objects_found += 1
                 
-                self.logger.info(f"✅ PIPELINE COMPLETE: {len(current_detections)} objects processed")
+                self.logger.info(f"PIPELINE COMPLETE: {len(current_detections)} objects processed")
                 last_detection_time = current_time
             
             # Draw only current detections (no persistence to avoid multiple boxes)
