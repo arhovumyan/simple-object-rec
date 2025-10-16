@@ -98,7 +98,7 @@ class AsyncObjectDetectionPipeline:
         self.min_box_size = 15  # Slightly larger minimum for faster processing
         self.multi_scale_detection = True
         self.input_resolution = 960  # Lower resolution for better FPS
-        self.enhance_small_objects = True  # Enable enhancement for small object detection
+        self.enhance_small_objects = False  # Disable enhancement for performance
         self.ultra_small_detection = False  # Disable sliding window for performance
         
         # Adaptive detection settings - optimized for high FPS
@@ -108,6 +108,11 @@ class AsyncObjectDetectionPipeline:
         self.base_detection_interval = 0.2  # 200ms base interval for better FPS
         self.max_detection_interval = 1.0   # 1 second max interval when static
         self.current_detection_interval = self.base_detection_interval
+        
+        # High-frequency target object detection (10Hz = 100ms)
+        self.target_detection_interval = 0.1  # 100ms for 10Hz target detection
+        self.last_target_detection_time = 0
+        self.active_target_tracks = set()  # Track IDs that are confirmed targets
         
         # Motion detection components
         self.prev_frame = None
@@ -474,6 +479,7 @@ class AsyncObjectDetectionPipeline:
                     break
         
         return merged_detections
+    
     
     def _merge_detections(self, all_detections):
         """Merge detections from multiple scales and remove duplicates"""
@@ -994,6 +1000,50 @@ class AsyncObjectDetectionPipeline:
         
         return list(self.tracked_objects.keys())
     
+    def update_target_tracks_high_freq(self, detections, frame_count):
+        """Update confirmed target tracks with high-frequency detection"""
+        if not self.active_target_tracks or not detections:
+            return
+        
+        # Filter detections for target objects only
+        target_detections = []
+        for detection in detections:
+            class_name = detection.get('class_name', '')
+            if class_name in ['person', 'backpack', 'suitcase', 'handbag', 'tie']:
+                target_detections.append(detection)
+        
+        if not target_detections:
+            return
+        
+        # Update existing target tracks with high-frequency detections
+        for track_id in list(self.active_target_tracks):
+            if track_id not in self.tracked_objects:
+                self.active_target_tracks.discard(track_id)
+                continue
+                
+            track = self.tracked_objects[track_id]
+            track_bbox = track['bbox']
+            
+            best_match = None
+            best_iou = 0
+            
+            # Find best matching detection
+            for detection in target_detections:
+                iou = self.calculate_iou(track_bbox, detection['bbox'])
+                if iou > best_iou and iou > 0.3:  # Minimum IoU threshold
+                    best_iou = iou
+                    best_match = detection
+            
+            # Update track if good match found
+            if best_match:
+                track['bbox'] = best_match['bbox']
+                track['yolo_class'] = best_match['class_name']
+                track['yolo_confidence'] = best_match['confidence']
+                track['hits'] += 1
+                track['age'] = 0
+                track['last_seen'] = frame_count
+                track['high_freq_updated'] = True  # Mark as high-freq updated
+    
     def get_tracks_needing_classification(self):
         """Get tracks that need classification"""
         tracks_to_classify = []
@@ -1031,6 +1081,10 @@ class AsyncObjectDetectionPipeline:
                     self.tracked_objects[track_id]['classification_result'] = result
                     self.tracked_objects[track_id]['is_target'] = is_target
                     self.tracked_objects[track_id]['target_type'] = target_type
+                    
+                    # Add to active target tracks for high-frequency updates
+                    if is_target:
+                        self.active_target_tracks.add(track_id)
                 
                 if is_target:
                     self.target_confirmations += 1
@@ -1210,6 +1264,18 @@ class AsyncObjectDetectionPipeline:
                     self.total_detections += len(detections)
                     last_detection_time = current_time
                 
+                # High-frequency target object detection (10Hz) - simplified approach
+                if current_time - self.last_target_detection_time >= self.target_detection_interval:
+                    # Quick detection for target objects using existing method
+                    if self.active_target_tracks:
+                        # Use existing detection method with lower confidence for speed
+                        quick_detections = self.detect_objects_yolo(frame)  # No enhancement for speed
+                        
+                        # Update confirmed target tracks with high-frequency detection
+                        self.update_target_tracks_high_freq(quick_detections, frame_count)
+                    
+                    self.last_target_detection_time = current_time
+                
                 # Get processed classification results
                 processed_results = self.get_processed_results()
                 
@@ -1250,7 +1316,8 @@ class AsyncObjectDetectionPipeline:
                 cv2.putText(frame, stats_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 
                 # Additional stats line
-                stats_text2 = f"Detections: {self.total_detections} | Targets: {self.target_objects_found} | Classified: {total_tracks_classified}"
+                active_targets = len(self.active_target_tracks)
+                stats_text2 = f"Detections: {self.total_detections} | Targets: {self.target_objects_found} | Active: {active_targets} | Classified: {total_tracks_classified}"
                 cv2.putText(frame, stats_text2, (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
                 
                 # Pipeline info
@@ -1265,8 +1332,10 @@ class AsyncObjectDetectionPipeline:
                            (10, height-60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 cv2.putText(frame, f"Confidence: {self.yolo_confidence:.2f} | IoU: 0.5 | Fast Tracking: ON", 
                            (10, height-40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame, f"Target Detection: 10Hz (100ms) | Active Targets: {active_targets}", 
+                           (10, height-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 cv2.putText(frame, f"Tracks Created: {total_tracks_created} | Confirmations: {self.target_confirmations}", 
-                           (10, height-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                           (10, height-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 
                 # Display frame
                 cv2.imshow('Async Object Detection Pipeline', frame)
