@@ -1,0 +1,42 @@
+# ROS2 Object Detection Pipeline Configuration
+
+# Model parameters
+yolo_model_path: "yolo11s.pt"  # Path to YOLO model file
+yolo_confidence: 0.4           # YOLO confidence threshold
+mobilenet_confidence: 0.5      # MobileNet confidence threshold
+max_detections: 10             # Maximum number of detections per frame
+
+# Detection parameters
+min_box_size: 15               # Minimum bounding box size in pixels
+multi_scale_detection: true    # Enable multi-scale detection
+input_resolution: 960          # Input resolution for processing
+enhance_small_objects: true    # Enable image enhancement for small objects
+ultra_small_detection: false   # Enable ultra-small object detection (sliding window)
+
+# Motion detection parameters
+motion_threshold: 1000         # Motion detection threshold
+base_detection_interval: 0.2   # Base detection interval in seconds
+max_detection_interval: 1.0    # Maximum detection interval in seconds
+
+# Tracking parameters
+max_track_age: 8               # Maximum track age before removal
+min_track_hits: 2              # Minimum hits before classification
+tracking_threshold: 0.4        # IoU threshold for tracking
+small_object_tracking: false   # Enable enhanced small object tracking
+
+# Queue parameters
+max_queue_size: 30             # Maximum classification queue size
+batch_size: 4                  # Batch size for classification
+
+# ROS2 parameters
+camera_topic: "/camera/image_raw"                    # Camera image topic
+detections_topic: "/object_detection/detections"     # All detections topic
+targets_topic: "/object_detection/targets"           # Target detections topic
+debug_image_topic: "/object_detection/debug_image"   # Debug image topic
+frame_id: "camera_link"                              # Frame ID for messages
+
+# Camera parameters (for camera publisher)
+camera_device: 0               # Camera device index
+camera_width: 960              # Camera width in pixels
+camera_height: 540             # Camera height in pixels
+camera_fps: 30                 # Camera FPS

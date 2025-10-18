@@ -109,4 +109,3 @@ datasets/
 # ROS specific
 devel/
 catkin_ws/
-ros2_ws/

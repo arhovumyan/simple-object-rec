@@ -1,0 +1,42 @@
+# High Performance Configuration for ROS2 Object Detection Pipeline
+
+# Model parameters - optimized for speed
+yolo_model_path: "yolo11s.pt"
+yolo_confidence: 0.5           # Higher confidence for faster processing
+mobilenet_confidence: 0.6      # Higher threshold for classification
+max_detections: 8              # Lower limit for better performance
+
+# Detection parameters - optimized for speed
+min_box_size: 20               # Larger minimum for faster processing
+multi_scale_detection: true    # Keep multi-scale but with fewer scales
+input_resolution: 800          # Lower resolution for better FPS
+enhance_small_objects: false   # Disable enhancement for performance
+ultra_small_detection: false   # Disable sliding window for performance
+
+# Motion detection parameters
+motion_threshold: 1200         # Higher threshold for less sensitivity
+base_detection_interval: 0.3   # Longer base interval for better FPS
+max_detection_interval: 1.5    # Longer max interval
+
+# Tracking parameters - optimized for speed
+max_track_age: 6               # Shorter age for better performance
+min_track_hits: 3              # Higher hits threshold for faster tracking
+tracking_threshold: 0.5        # Higher IoU threshold for faster processing
+small_object_tracking: false   # Disable for better performance
+
+# Queue parameters - optimized for speed
+max_queue_size: 20             # Smaller queue for lower latency
+batch_size: 6                  # Larger batch size for efficiency
+
+# ROS2 parameters
+camera_topic: "/camera/image_raw"
+detections_topic: "/object_detection/detections"
+targets_topic: "/object_detection/targets"
+debug_image_topic: "/object_detection/debug_image"
+frame_id: "camera_link"
+
+# Camera parameters - optimized for speed
+camera_device: 0
+camera_width: 800              # Lower resolution for better FPS
+camera_height: 450
+camera_fps: 60                 # Higher FPS target

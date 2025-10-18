@@ -1,0 +1,42 @@
+# High Accuracy Configuration for ROS2 Object Detection Pipeline
+
+# Model parameters - optimized for accuracy
+yolo_model_path: "yolo11s.pt"
+yolo_confidence: 0.3           # Lower confidence for more detections
+mobilenet_confidence: 0.4      # Lower threshold for classification
+max_detections: 15             # Higher limit for more detections
+
+# Detection parameters - optimized for accuracy
+min_box_size: 10               # Smaller minimum for more small objects
+multi_scale_detection: true    # Enable multi-scale detection
+input_resolution: 1280         # Higher resolution for better accuracy
+enhance_small_objects: true    # Enable enhancement for small objects
+ultra_small_detection: true    # Enable sliding window for ultra-small objects
+
+# Motion detection parameters
+motion_threshold: 800          # Lower threshold for more sensitivity
+base_detection_interval: 0.1   # Shorter base interval for more frequent detection
+max_detection_interval: 0.8    # Shorter max interval
+
+# Tracking parameters - optimized for accuracy
+max_track_age: 12              # Longer age for better tracking
+min_track_hits: 2              # Lower hits threshold for faster classification
+tracking_threshold: 0.3        # Lower IoU threshold for better matching
+small_object_tracking: true    # Enable enhanced small object tracking
+
+# Queue parameters - optimized for accuracy
+max_queue_size: 50             # Larger queue for more objects
+batch_size: 3                  # Smaller batch size for faster processing
+
+# ROS2 parameters
+camera_topic: "/camera/image_raw"
+detections_topic: "/object_detection/detections"
+targets_topic: "/object_detection/targets"
+debug_image_topic: "/object_detection/debug_image"
+frame_id: "camera_link"
+
+# Camera parameters - optimized for accuracy
+camera_device: 0
+camera_width: 1280             # Higher resolution for better accuracy
+camera_height: 720
+camera_fps: 30                 # Standard FPS for accuracy
