@@ -4,7 +4,7 @@ A robust real-time object detection system using YOLO models and MobileNetV3, op
 
 ## Features
 
-- **Real-time object detection** with YOLOv8
+
 - **Enhanced classification** with MobileNetV3
 - **Anti-flickering system** with object persistence
 - **GPU acceleration** (Apple MPS for Apple Silicon)
